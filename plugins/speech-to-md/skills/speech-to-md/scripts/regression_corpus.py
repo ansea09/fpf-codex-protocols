@@ -67,7 +67,12 @@ def check_model_auto_discovery_quality_floor(work_dir: Path) -> None:
     model_dir.mkdir()
     (model_dir / "ggml-tiny.bin").write_bytes(b"tiny model should not be auto-discovered\n")
     (model_dir / "ggml-base.bin").write_bytes(b"base model should not be auto-discovered\n")
-    env = {**os.environ, "SPEECH_TO_MD_MODELS_DIR": str(model_dir)}
+    env = {
+        **os.environ,
+        "CODEX_HOME": str(work_dir / "isolated-codex-home"),
+        "HOME": str(work_dir / "isolated-home"),
+        "SPEECH_TO_MD_MODELS_DIR": str(model_dir),
+    }
     doctor = json.loads(run([sys.executable, str(WRAPPER), "--doctor", "--json"], env=env).stdout)
     model_check = next(item for item in doctor["checks"] if item["name"] == "whisper-model")
     if model_check["status"] != "warn":
