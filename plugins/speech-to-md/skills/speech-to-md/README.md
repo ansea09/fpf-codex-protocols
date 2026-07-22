@@ -82,6 +82,22 @@ If the local Metal/GPU backend fails, retry with CPU fallback:
 speech-to-md recording.wav -o recording-audio-bundle --model /path/to/ggml-model.bin --no-gpu
 ```
 
+Long local ASR runs are streamed. The wrapper no longer kills `whisper.cpp`
+because the total ASR wall time is long; it only applies `--asr-idle-timeout`
+when no stdout progress is seen. The default `--asr-idle-timeout 0` disables
+this ASR inactivity timeout.
+
+While `whisper.cpp` emits timestamped stdout, the wrapper can write a
+best-effort partial bundle next to the final output:
+
+```bash
+speech-to-md long-recording.mp3 -o long-recording-audio-bundle --partial-bundle-interval 300
+```
+
+The partial output path is `<output>.partial`. Treat it as progress evidence
+only; the final bundle is still parsed from the completed `whisper.cpp` JSON/TXT
+outputs.
+
 ## Output
 
 The bundle contains:
