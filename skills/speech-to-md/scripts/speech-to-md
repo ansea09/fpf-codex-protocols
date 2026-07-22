@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import queue
 from dataclasses import dataclass
 import hashlib
 import json
@@ -13,6 +14,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,6 +24,10 @@ SCHEMA = "speech-to-md.bundle.v1"
 SEGMENTS_SCHEMA = "speech-to-md.segments.v1"
 WHISPER_CPP_DIRECT_EXTENSIONS = {".wav", ".wave", ".mp3", ".flac"}
 AUDIO_NORMALIZATION_MODES = {"auto", "always", "never"}
+WHISPER_STDOUT_SEGMENT_RE = re.compile(
+    r"^\s*\[(?P<start>\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?)\s+-->\s+"
+    r"(?P<end>\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?)\]\s*(?P<text>.*)\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -335,6 +342,157 @@ def parse_transcript_payload(path: Path) -> tuple[str, list[dict[str, Any]], str
     return normalize_text(text), segment_from_text(text), "text"
 
 
+def coerce_stdout_segment(line: str, index: int) -> dict[str, Any] | None:
+    match = WHISPER_STDOUT_SEGMENT_RE.match(line)
+    if not match:
+        return None
+    text = match.group("text").strip()
+    if not text:
+        return None
+    start = parse_timestamp(match.group("start"))
+    end = parse_timestamp(match.group("end"))
+    return {
+        "index": index,
+        "start": start,
+        "end": end,
+        "start_label": seconds_label(start),
+        "end_label": seconds_label(end),
+        "speaker": None,
+        "text": text,
+    }
+
+
+def run_streaming_process(
+    command: list[str],
+    *,
+    idle_timeout: int,
+    on_line: Any | None = None,
+) -> tuple[int, str]:
+    proc = subprocess.Popen(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    line_queue: queue.Queue[str | object] = queue.Queue()
+    sentinel = object()
+
+    def read_stdout() -> None:
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line_queue.put(line)
+        finally:
+            line_queue.put(sentinel)
+
+    reader = threading.Thread(target=read_stdout, daemon=True)
+    reader.start()
+
+    output_lines: list[str] = []
+    last_activity = time.monotonic()
+    reader_done = False
+    while True:
+        try:
+            item = line_queue.get(timeout=1)
+        except queue.Empty:
+            item = None
+
+        if item is sentinel:
+            reader_done = True
+        elif isinstance(item, str):
+            output_lines.append(item)
+            last_activity = time.monotonic()
+            if on_line:
+                on_line(item, output_lines)
+
+        returncode = proc.poll()
+        if returncode is not None and reader_done and line_queue.empty():
+            reader.join(timeout=1)
+            return returncode, "".join(output_lines)
+
+        if idle_timeout > 0 and returncode is None and time.monotonic() - last_activity > idle_timeout:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            raise subprocess.TimeoutExpired(command, idle_timeout, output="".join(output_lines))
+
+
+def partial_bundle_dir_for(output_dir: Path) -> Path:
+    resolved = output_dir.expanduser().resolve()
+    return resolved.with_name(f"{resolved.name}.partial")
+
+
+def write_partial_bundle(
+    *,
+    partial_dir: Path,
+    source_audio: Path,
+    content: str,
+    segments: list[dict[str, Any]],
+    engine: dict[str, Any],
+    warnings: list[str],
+) -> None:
+    if not segments and not normalize_text(content).strip():
+        return
+    temp_parent = partial_dir.parent
+    temp_parent.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix=f".{partial_dir.name}.", dir=str(temp_parent)))
+    bundle_dir = temp_dir / "bundle"
+    try:
+        partial_engine = dict(engine)
+        partial_engine.update(
+            {
+                "partial": True,
+                "partial_updated_at": utc_now(),
+                "partial_segment_count": len(segments),
+            }
+        )
+        partial_warnings = [
+            "PARTIAL transcript bundle: ASR is still running or did not complete.",
+            "Partial segments are parsed from whisper.cpp stdout; the final bundle is parsed from whisper.cpp JSON/TXT output.",
+            *warnings,
+        ]
+        write_bundle(
+            output_dir=bundle_dir,
+            source_audio=source_audio,
+            transcript_path=None,
+            content=content,
+            segments=segments,
+            engine=partial_engine,
+            warnings=partial_warnings,
+            import_kind=None,
+            vtt_path=None,
+        )
+        (bundle_dir / "conversion-report.md").write_text(
+            "\n".join(
+                [
+                    "# Conversion Report",
+                    "",
+                    "- Status: `partial`",
+                    f"- Engine: `{engine.get('name', 'unknown')}`",
+                    f"- Output bundle: `{partial_dir}`",
+                    f"- Segment count: `{len(segments)}`",
+                    f"- Updated at: `{partial_engine['partial_updated_at']}`",
+                    f"- Warnings: `{len(partial_warnings)}`",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        if output_exists(partial_dir):
+            if partial_dir.is_dir() and not partial_dir.is_symlink():
+                shutil.rmtree(partial_dir)
+            else:
+                partial_dir.unlink()
+        bundle_dir.replace(partial_dir)
+    finally:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def doctor_payload(args: argparse.Namespace) -> dict[str, Any]:
     adapter = require_engine_adapter(getattr(args, "engine", None))
     whisper_bin = args.whisper_bin or os.environ.get("SPEECH_TO_MD_WHISPER_CPP_BIN") or which("whisper-cli")
@@ -500,15 +658,14 @@ def run_whisper_cpp(args: argparse.Namespace, work_dir: Path) -> EngineRun:
     if no_gpu:
         command.append("-ng")
         manifest_command.append("-ng")
-    proc = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=args.timeout)
     engine = {
         "name": "whisper.cpp",
         "adapter": "whisper-cpp",
         "contract": "speech-to-md.asr-engine.v1",
         "capabilities": engine_capabilities(require_engine_adapter("whisper-cpp")),
         "command": manifest_command,
-        "returncode": proc.returncode,
-        "output_tail": "\n".join((proc.stdout or "").splitlines()[-80:]),
+        "returncode": None,
+        "output_tail": "",
         "model": str(model_path),
         "language": args.language,
         "no_gpu": no_gpu,
@@ -521,8 +678,54 @@ def run_whisper_cpp(args: argparse.Namespace, work_dir: Path) -> EngineRun:
         "audio_preprocess": audio_preprocess,
         "runtime": runtime_fingerprint(whisper_bin, model_path, configured_ffmpeg(args)),
     }
-    if proc.returncode != 0:
-        raise RuntimeError("whisper.cpp failed:\n" + (proc.stdout or "").strip())
+    partial_segments: list[dict[str, Any]] = []
+    last_partial_at = 0.0
+    partial_interval = max(0, args.partial_bundle_interval)
+    partial_dir = partial_bundle_dir_for(args.output)
+
+    def capture_progress(line: str, output_lines: list[str]) -> None:
+        nonlocal last_partial_at
+        segment = coerce_stdout_segment(line, len(partial_segments) + 1)
+        if segment:
+            partial_segments.append(segment)
+        now = time.monotonic()
+        if partial_interval > 0 and partial_segments and now - last_partial_at >= partial_interval:
+            partial_content = normalize_text("\n\n".join(item["text"] for item in partial_segments))
+            progress_engine = dict(engine)
+            progress_engine["output_tail"] = "\n".join("".join(output_lines).splitlines()[-80:])
+            write_partial_bundle(
+                partial_dir=partial_dir,
+                source_audio=source,
+                content=partial_content,
+                segments=partial_segments,
+                engine=progress_engine,
+                warnings=[],
+            )
+            last_partial_at = now
+
+    returncode, process_output = run_streaming_process(
+        command,
+        idle_timeout=args.asr_idle_timeout,
+        on_line=capture_progress,
+    )
+    if partial_interval > 0 and partial_segments:
+        partial_content = normalize_text("\n\n".join(item["text"] for item in partial_segments))
+        progress_engine = dict(engine)
+        progress_engine["returncode"] = returncode
+        progress_engine["output_tail"] = "\n".join(process_output.splitlines()[-80:])
+        write_partial_bundle(
+            partial_dir=partial_dir,
+            source_audio=source,
+            content=partial_content,
+            segments=partial_segments,
+            engine=progress_engine,
+            warnings=[],
+        )
+
+    engine["returncode"] = returncode
+    engine["output_tail"] = "\n".join(process_output.splitlines()[-80:])
+    if returncode != 0:
+        raise RuntimeError("whisper.cpp failed:\n" + process_output.strip())
     json_path = prefix.with_suffix(".json")
     txt_path = prefix.with_suffix(".txt")
     vtt_path = prefix.with_suffix(".vtt")
@@ -760,7 +963,19 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("SPEECH_TO_MD_AUDIO_NORMALIZATION", "auto"),
         help="Use ffmpeg to normalize audio to mono 16 kHz WAV: auto for non-native containers, always, or never.",
     )
-    parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--timeout", type=int, default=1800, help="Timeout in seconds for helper steps such as ffmpeg normalization.")
+    parser.add_argument(
+        "--asr-idle-timeout",
+        type=int,
+        default=0,
+        help="Kill whisper.cpp only after this many seconds without stdout output; 0 disables ASR timeout.",
+    )
+    parser.add_argument(
+        "--partial-bundle-interval",
+        type=int,
+        default=300,
+        help="Write a best-effort <output>.partial transcript bundle every N seconds while whisper.cpp emits timestamped stdout; 0 disables.",
+    )
     parser.add_argument("--max-input-mb", type=int, default=2048)
     parser.add_argument("--force", action="store_true", help="Replace an existing output bundle.")
     parser.add_argument("--doctor", action="store_true")

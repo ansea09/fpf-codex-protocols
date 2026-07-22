@@ -22,6 +22,18 @@ and warnings when quoteability or trust matters.
 | `conversion-report.md` | Short human-readable run report. |
 | `timestamps.vtt` | Optional timed text emitted by the ASR engine. |
 
+## Partial Bundle
+
+During long ASR runs, the wrapper may write a separate best-effort partial
+bundle at `<output>.partial`. This path is outside the final output directory.
+It uses the same basic bundle shape so agents can inspect interim progress, but
+its `conversion-report.md` marks status as `partial`, and its `audit.md`
+contains partial-output warnings.
+
+Use the partial bundle only for progress inspection or recovery context while
+ASR is still running. Once the final output bundle exists, prefer the final
+bundle for analysis, quoting, and transfer.
+
 ## Agent Reading Order
 
 1. Read `LLM_README.md`.

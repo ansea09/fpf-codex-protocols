@@ -102,6 +102,35 @@ The equivalent environment flag is:
 export SPEECH_TO_MD_WHISPER_CPP_NO_GPU=1
 ```
 
+## Long ASR Runs And Partial Bundles
+
+The wrapper runs `whisper.cpp` as a streaming process. `--timeout` remains a
+helper-step timeout for operations such as `ffmpeg` normalization; it is not a
+total wall-time limit for ASR.
+
+Use `--asr-idle-timeout N` to kill `whisper.cpp` only after N seconds without
+stdout progress. The default is `0`, which disables the ASR inactivity timeout.
+This is the safer default for long trusted local recordings whose processing
+time depends on model size, hardware, language, and audio length.
+
+When `whisper.cpp` emits timestamped stdout, the wrapper can write a
+best-effort partial bundle:
+
+```bash
+speech-to-md long-recording.mp3 -o long-recording-audio-bundle --partial-bundle-interval 300
+```
+
+The partial path is `<output>.partial`. It is replaced atomically on each
+partial write when possible. Partial bundles are progress evidence only:
+
+- they may be absent if the engine does not emit parseable timestamped stdout;
+- they may lag behind the current ASR process;
+- they may not match the final JSON/TXT transcript exactly;
+- they must not be treated as the final source of truth.
+
+The final bundle is still produced only after `whisper.cpp` exits successfully
+and the wrapper parses the completed JSON/TXT outputs.
+
 ## Import Existing Transcript
 
 When ASR has already been run by another trusted tool, package the transcript:

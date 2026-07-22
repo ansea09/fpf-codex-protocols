@@ -79,6 +79,15 @@ fallback:
 speech-to-md lecture.wav -o lecture-audio-bundle --model /path/to/ggml-model.bin --no-gpu
 ```
 
+For long local ASR runs, `speech-to-md` streams `whisper.cpp` output. It does
+not use the helper `--timeout` as a total ASR wall-time kill switch. Use
+`--asr-idle-timeout N` only when the process should be killed after N seconds
+without stdout progress; `0` disables that inactivity timeout. The wrapper may
+write best-effort `<output>.partial` bundles every
+`--partial-bundle-interval` seconds while timestamped stdout is available. Use
+partial bundles only as progress evidence; the final bundle remains the source
+of truth after ASR completes.
+
 4. Or package an existing transcript:
 
 ```bash
